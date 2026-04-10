@@ -1,6 +1,7 @@
 import os
 import io
 import base64
+import csv
 import json
 import datetime
 import subprocess
@@ -208,16 +209,125 @@ def _decision_counts() -> dict:
     return counts
 
 
+# ── Index CSV helpers ─────────────────────────────────────────────────────────
+
+INDEX_FIELDNAMES = [
+    "image_id", "company_id", "company_name",
+    "job_id", "url", "status", "annotated_by", "date", "notes",
+]
+
+def _load_index() -> list[dict]:
+    """Load index.csv. Returns empty list if missing."""
+    if not os.path.exists(INDEX_CSV):
+        return []
+    with open(INDEX_CSV, newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def _save_index(rows: list[dict]):
+    with open(INDEX_CSV, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=INDEX_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _index_counts(rows: list[dict]) -> dict:
+    counts = {"approved": 0, "rejected": 0, "pending": 0}
+    for r in rows:
+        s = r.get("status", "pending")
+        if s in counts:
+            counts[s] += 1
+    return counts
+
+
+def _fetch_image_from_url(url: str) -> tuple[str, str]:
+    """
+    Fetch image from a cloud URL, run YOLO inference, return (base64_jpeg, labels_html).
+    Returns ("", error_message) on failure.
+    """
+    import urllib.request
+    import html as _html
+
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "onesvs-review/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            raw = r.read()
+        from PIL import ImageOps
+        img = ImageOps.exif_transpose(
+            Image.open(io.BytesIO(raw)).convert("RGB")
+        )
+    except Exception as e:
+        return "", f"Could not fetch image: {_html.escape(str(e))}"
+
+    # Run YOLO inference
+    labels = []
+    try:
+        from PIL import ImageDraw, ImageFont
+        results = model(img)
+        draw = ImageDraw.Draw(img)
+        try:
+            font = ImageFont.truetype(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 18)
+        except Exception:
+            font = ImageFont.load_default()
+        colors = ["#00d4ff","#1abc9c","#e67e22","#e74c3c","#9b59b6",
+                  "#3498db","#f1c40f","#2ecc71","#e91e63","#ff5722"]
+        for res in results:
+            masks = res.masks
+            for i, box in enumerate(res.boxes):
+                color        = colors[i % len(colors)]
+                x1,y1,x2,y2 = [float(v) for v in box.xyxy[0].tolist()]
+                conf         = float(box.conf)
+                label        = model.names[int(box.cls)]
+                if masks is not None and i < len(masks.xy):
+                    pts = [(float(x), float(y)) for x, y in masks.xy[i]]
+                    if len(pts) >= 3:
+                        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+                        odraw   = ImageDraw.Draw(overlay)
+                        rv, gv, bv = tuple(int(color.lstrip("#")[j:j+2], 16) for j in (0, 2, 4))
+                        odraw.polygon(pts, fill=(rv, gv, bv, 80))
+                        odraw.line(pts + [pts[0]], fill=color, width=3)
+                        img  = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+                        draw = ImageDraw.Draw(img)
+                else:
+                    draw.rectangle([x1,y1,x2,y2], outline=color, width=3)
+                tag       = f"{label} {conf:.0%}"
+                bbox_text = draw.textbbox((x1+4, y1+4), tag, font=font)
+                draw.rectangle(bbox_text, fill=color)
+                draw.text((x1+4, y1+4), tag, fill="#fff", font=font)
+                labels.append(label)
+        labels = list(set(labels))
+    except Exception:
+        pass  # Show image without annotations if inference fails
+
+    max_w = 1000
+    if img.width > max_w:
+        img = img.resize((max_w, int(img.height * max_w / img.width)), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    img_b64 = base64.b64encode(buf.getvalue()).decode()
+
+    label_pills = "".join(
+        f'<span class="pill">{l}</span>' for l in sorted(labels)
+    ) or '<span style="color:#888">No detections</span>'
+
+    return img_b64, label_pills
+
+
 @app.get("/", response_class=HTMLResponse)
 def home():
-    """Simple approve / reject review page — one photo at a time."""
-    queue  = _queue_photos()
-    counts = _decision_counts()
+    """Simple approve / reject review page — driven by index.csv cloud URLs."""
+    import html as _html
+
+    rows   = _load_index()
+    counts = _index_counts(rows)
+    queue  = [r for r in rows if r.get("status", "pending") == "pending"]
+
+    approved_count = counts["approved"]
+    rejected_count = counts["rejected"]
 
     # ── Empty state ───────────────────────────────────────────────────────────
     if not queue:
-        approved = counts["approved"]
-        rejected = counts["reject"]
         return f"""
         <!DOCTYPE html>
         <html>
@@ -250,11 +360,11 @@ def home():
                 <p>No photos waiting for review.</p>
                 <div class="stats">
                     <div class="stat">
-                        <div class="stat-num green">{approved}</div>
+                        <div class="stat-num green">{approved_count}</div>
                         <div class="stat-lbl">Approved</div>
                     </div>
                     <div class="stat">
-                        <div class="stat-num red">{rejected}</div>
+                        <div class="stat-num red">{rejected_count}</div>
                         <div class="stat-lbl">Rejected</div>
                     </div>
                 </div>
@@ -274,99 +384,16 @@ def home():
         </html>
         """
 
-    # ── Stats ──────────────────────────────────────────────────────────────────
-    approved_count = counts["approved"]
-    rejected_count = counts["reject"]
+    # ── Next pending photo from index.csv ─────────────────────────────────────
+    row         = queue[0]
+    total       = len(queue)
+    image_id    = str(row.get("image_id", ""))
+    url         = row.get("url", "")
+    company     = _html.escape(row.get("company_name", ""))
+    job_id      = _html.escape(str(row.get("job_id", "")))
+    notes       = _html.escape(row.get("notes", ""))
 
-    # ── Load + annotate next photo ────────────────────────────────────────────
-    fname   = queue[0]
-    total   = len(queue)
-    path    = os.path.join(REVIEW_DIR, fname)
-    coco    = _load_coco()
-
-    # Check if annotations.json has entries for this photo
-    img_record = next((i for i in coco["images"] if i["file_name"] == fname), None)
-    has_annotations = img_record and any(
-        a["image_id"] == img_record["id"] for a in coco.get("annotations", [])
-    )
-
-    labels     = []
-    error_note = ""
-
-    try:
-        img = _fix_orientation(Image.open(path).convert("RGB"))
-
-        if has_annotations:
-            # Draw saved annotations
-            img = _draw_annotations(img, fname, coco)
-            cat_by_id = {c["id"]: c["name"] for c in coco.get("categories", [])}
-            labels = list({cat_by_id.get(a["category_id"], "?")
-                           for a in coco.get("annotations", [])
-                           if a["image_id"] == img_record["id"]})
-        else:
-            # No annotations — run live YOLO inference
-            chosen_model = model
-            results = chosen_model(img)
-            from PIL import ImageDraw, ImageFont
-            draw = ImageDraw.Draw(img)
-            try:
-                font = ImageFont.truetype(
-                    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 18)
-            except Exception:
-                font = ImageFont.load_default()
-            colors = ["#00d4ff","#1abc9c","#e67e22","#e74c3c","#9b59b6",
-                      "#3498db","#f1c40f","#2ecc71","#e91e63","#ff5722"]
-            for r in results:
-                masks = r.masks
-                for i, box in enumerate(r.boxes):
-                    color        = colors[i % len(colors)]
-                    x1,y1,x2,y2 = [float(v) for v in box.xyxy[0].tolist()]
-                    conf         = float(box.conf)
-                    label        = chosen_model.names[int(box.cls)]
-
-                    # Draw segmentation mask polygon if available
-                    if masks is not None and i < len(masks.xy):
-                        pts = [(float(x), float(y)) for x, y in masks.xy[i]]
-                        if len(pts) >= 3:
-                            # Semi-transparent fill
-                            overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-                            odraw   = ImageDraw.Draw(overlay)
-                            r_val, g_val, b_val = tuple(
-                                int(color.lstrip("#")[j:j+2], 16) for j in (0, 2, 4)
-                            )
-                            odraw.polygon(pts, fill=(r_val, g_val, b_val, 80))
-                            odraw.line(pts + [pts[0]], fill=color, width=3)
-                            img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
-                            draw = ImageDraw.Draw(img)
-                    else:
-                        # Fallback to bounding box
-                        draw.rectangle([x1,y1,x2,y2], outline=color, width=3)
-
-                    tag       = f"{label} {conf:.0%}"
-                    bbox_text = draw.textbbox((x1+4, y1+4), tag, font=font)
-                    draw.rectangle(bbox_text, fill=color)
-                    draw.text((x1+4, y1+4), tag, fill="#fff", font=font)
-                    labels.append(label)
-            labels = list(set(labels))
-
-        # Resize for display — cap at 1000px wide
-        max_w = 1000
-        if img.width > max_w:
-            img = img.resize((max_w, int(img.height * max_w / img.width)), Image.LANCZOS)
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=85)
-        img_b64 = base64.b64encode(buf.getvalue()).decode()
-
-    except Exception as e:
-        img_b64 = ""
-        error_note = f"Could not load image: {e}"
-
-    label_pills = "".join(
-        f'<span class="pill">{l}</span>' for l in sorted(labels)
-    ) or '<span style="color:#888">No detections</span>'
-
-    import html as _html
-    safe_fname = _html.escape(fname)
+    img_b64, label_pills = _fetch_image_from_url(url)
 
     return f"""
     <!DOCTYPE html>
@@ -438,25 +465,25 @@ def home():
 
         <div class="photo-wrap">
             {"<img src='data:image/jpeg;base64," + img_b64 + "' alt='Review photo'>" if img_b64
-             else f'<div class="no-img">{error_note}</div>'}
+             else '<div class="no-img">Could not load image</div>'}
         </div>
 
         <div class="meta">{label_pills}</div>
 
         <div class="actions">
             <form method="post" action="/decision" style="flex:1;display:contents;" id="form-approve">
-                <input type="hidden" name="fname"  value="{safe_fname}">
-                <input type="hidden" name="source" value="review_queue">
+                <input type="hidden" name="image_id" value="{image_id}">
+                <input type="hidden" name="source"   value="index">
                 <button class="btn approve" name="action" value="approve">✅ Approve</button>
             </form>
             <form method="post" action="/decision" style="flex:1;display:contents;" id="form-reject">
-                <input type="hidden" name="fname"  value="{safe_fname}">
-                <input type="hidden" name="source" value="review_queue">
+                <input type="hidden" name="image_id" value="{image_id}">
+                <input type="hidden" name="source"   value="index">
                 <button class="btn reject" name="action" value="reject">❌ Reject</button>
             </form>
             <form method="post" action="/decision" id="form-skip">
-                <input type="hidden" name="fname"  value="{safe_fname}">
-                <input type="hidden" name="source" value="review_queue">
+                <input type="hidden" name="image_id" value="{image_id}">
+                <input type="hidden" name="source"   value="index">
                 <button class="btn skip" name="action" value="skip">⏭ Skip</button>
             </form>
         </div>
@@ -467,7 +494,7 @@ def home():
             <span class="kbd">S</span> skip
         </div>
 
-        <p class="fname">{safe_fname}</p>
+        <p class="fname">{company} · Job {job_id}{" · " + notes if notes else ""}</p>
         <div style="display:flex;gap:20px;margin-top:16px;">
             <a class="tools-link" href="/gallery">🖼 Browse all</a>
             <a class="tools-link" href="/tools">⚙ Tools</a>
@@ -1177,6 +1204,36 @@ async def decision(request: Request):
         action = str(form.get("action", "")).strip()
         fname  = str(form.get("fname",  "")).strip()
         source = str(form.get("source", "")).strip()
+
+        if source == "index":
+            image_id = str(form.get("image_id", "")).strip()
+            if image_id:
+                rows = _load_index()
+                new_status = "approved" if action == "approve" else ("pending" if action == "skip" else "rejected")
+                for r in rows:
+                    if str(r.get("image_id", "")) == image_id:
+                        r["status"] = new_status
+                        r["date"]   = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+                        break
+                _save_index(rows)
+
+                entry = {
+                    "image_id": image_id,
+                    "action":   action,
+                    "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+                }
+                with open(DECISIONS_LOG, "a") as f:
+                    f.write(json.dumps(entry) + "\n")
+
+                if DECISION_WEBHOOK:
+                    try:
+                        async with httpx.AsyncClient(timeout=10) as client:
+                            headers = {"X-Laravel-Secret": LARAVEL_SECRET} if LARAVEL_SECRET else {}
+                            await client.post(DECISION_WEBHOOK, json=entry, headers=headers)
+                    except Exception:
+                        pass
+
+            return RedirectResponse(url="/", status_code=303)
 
         if source == "review_queue" and fname:
             src_path = os.path.join(REVIEW_DIR, fname)
