@@ -1493,10 +1493,13 @@ class ModelReportWindow:
 # Default connection — reads from .env if present
 def _read_env_db():
     """Try to read DB credentials from Laravel .env file."""
-    env_paths = [
+    # LARAVEL_ENV_PATH can be set in the FastAPI .env to point to the Laravel app's .env
+    laravel_env = os.getenv("LARAVEL_ENV_PATH", "")
+    env_paths = [p for p in [
+        laravel_env,
         "/mnt/c/xampp/htdocs/website_rebuild/.env",
         os.path.join(os.path.dirname(_SCRIPT_DIR), ".env"),
-    ]
+    ] if p]
     vals = {"host": "127.0.0.1", "port": "3306", "db": "staging_db",
             "user": "mylfs", "password": ""}
     for path in env_paths:
