@@ -1,5 +1,38 @@
+# onesvs FastAPI — full dependency list
+# Install: pip install -r requirements.txt
+#
+# Also install (git-hosted):
+#   pip install git+https://github.com/ChaoningZhang/MobileSAM.git
+#
+# Model weights — place in Annotator/Model/:
+#   mobile_sam.pt : https://github.com/ChaoningZhang/MobileSAM/raw/master/weights/mobile_sam.pt
+
+# API
 fastapi
 uvicorn[standard]
-ultralytics
 python-dotenv
 python-multipart
+httpx
+
+# ML / Inference
+ultralytics
+torch
+torchvision
+Pillow>=10.0
+numpy
+
+# Annotation tools (annotate.py, browser.py, review.py)
+opencv-python-headless
+shapely
+timm
+matplotlib
+
+# Database
+mysql-connector-python
+psycopg2-binary
+
+# OCR
+easyocr
+
+# Reporting
+python-pptx
