@@ -164,6 +164,7 @@ class AnnotationTool:
         self._load_image(0)
         self._bind_keys()
         self.root.after(100, self._refresh_image_browser)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Warm up SAM in background so first "Tighten" is fast
         threading.Thread(target=self._sam_warmup, daemon=True).start()
@@ -193,22 +194,32 @@ class AnnotationTool:
                 ],
             }
 
-    def _save(self):
-        self._rebuild_lookup()
-        self._set_status(f"Saved → {os.path.basename(self.json_path)}")
-        self._sync_db()
+    def _write_json(self):
+        """Atomic write to json_path — writes to a temp file then renames to prevent corruption."""
         payload = json.dumps(self.coco)
         path    = self.json_path
-        threading.Thread(target=lambda: open(path, "w").write(payload), daemon=True).start()
+        tmp     = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(payload)
+        os.replace(tmp, path)
+
+    def _save(self):
+        self._rebuild_lookup()
+        self._write_json()
+        self._set_status(f"Saved → {os.path.basename(self.json_path)}")
+        self._sync_db()
 
     def _autosave(self, status_msg=""):
         self._rebuild_lookup()
+        self._write_json()
         if status_msg:
             self._set_status(f"{status_msg}  ✓ saved")
-        self._sync_db()
-        payload = json.dumps(self.coco)
-        path    = self.json_path
-        threading.Thread(target=lambda: open(path, "w").write(payload), daemon=True).start()
+
+    def _on_close(self):
+        """Save annotations synchronously before closing the window."""
+        self._rebuild_lookup()
+        self._write_json()
+        self.root.destroy()
 
     def _sync_db(self):
         """Push annotation stats to ml_workspace.db in the background (non-blocking)."""
